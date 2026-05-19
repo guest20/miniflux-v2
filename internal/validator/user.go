@@ -69,8 +69,8 @@ func ValidateUserModification(store *storage.Storage, userID int64, changes *mod
 	}
 
 	if changes.EntryDirection != nil {
-		if err := validateEntryDirection(*changes.EntryDirection); err != nil {
-			return err
+		if err := ValidateDirection(*changes.EntryDirection); err != nil {
+			return locale.NewLocalizedError("error.invalid_entry_direction")
 		}
 	}
 
@@ -211,15 +211,8 @@ func validateTimezone(timezoneValue string) *locale.LocalizedError {
 	return nil
 }
 
-func validateEntryDirection(direction string) *locale.LocalizedError {
-	if direction != "asc" && direction != "desc" {
-		return locale.NewLocalizedError("error.invalid_entry_direction")
-	}
-	return nil
-}
-
 func validateEntriesPerPage(entriesPerPage int) *locale.LocalizedError {
-	if entriesPerPage < 1 {
+	if entriesPerPage < 1 || entriesPerPage > model.MaxEntryLimit {
 		return locale.NewLocalizedError("error.entries_per_page_invalid")
 	}
 	return nil

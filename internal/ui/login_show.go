@@ -8,8 +8,6 @@ import (
 
 	"miniflux.app/v2/internal/http/request"
 	"miniflux.app/v2/internal/http/response"
-	"miniflux.app/v2/internal/http/route"
-	"miniflux.app/v2/internal/ui/session"
 	"miniflux.app/v2/internal/ui/view"
 )
 
@@ -21,12 +19,11 @@ func (h *handler) showLoginPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		response.HTMLRedirect(w, r, route.Path(h.router, user.DefaultHomePage))
+		response.HTMLRedirect(w, r, h.basePath+"/"+user.DefaultHomePage)
 		return
 	}
 
-	sess := session.New(h.store, request.SessionID(r))
-	view := view.New(h.tpl, r, sess)
+	view := view.New(h.tpl, r)
 	redirectURL := request.QueryStringParam(r, "redirect_url", "")
 	view.Set("redirectURL", redirectURL)
 	response.HTML(w, r, view.Render("login"))

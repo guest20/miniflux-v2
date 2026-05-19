@@ -14,7 +14,6 @@ import (
 	"miniflux.app/v2/internal/config"
 	"miniflux.app/v2/internal/http/request"
 	"miniflux.app/v2/internal/http/response"
-	"miniflux.app/v2/internal/http/route"
 	"miniflux.app/v2/internal/integration"
 	"miniflux.app/v2/internal/mediaproxy"
 	"miniflux.app/v2/internal/model"
@@ -25,14 +24,7 @@ import (
 	"miniflux.app/v2/internal/storage"
 	"miniflux.app/v2/internal/urllib"
 	"miniflux.app/v2/internal/validator"
-
-	"github.com/gorilla/mux"
 )
-
-type handler struct {
-	store  *storage.Storage
-	router *mux.Router
-}
 
 var (
 	errEmptyFeedTitle   = errors.New("googlereader: empty feed title")
@@ -41,96 +33,43 @@ var (
 	errSimultaneously   = fmt.Errorf("googlereader: %s and %s should not be supplied simultaneously", keptUnreadStreamSuffix, readStreamSuffix)
 )
 
-// Serve handles Google Reader API calls.
-func Serve(router *mux.Router, store *storage.Storage) {
-	handler := &handler{store, router}
-	router.HandleFunc("/accounts/ClientLogin", handler.clientLoginHandler).Methods(http.MethodPost).Name("ClientLogin")
+// NewHandler returns an http.Handler that handles Google Reader API calls.
+// The returned handler expects the base path to be stripped from the request URL.
+func NewHandler(store *storage.Storage) http.Handler {
+	h := &greaderHandler{
+		store: store,
+	}
 
-	middleware := newMiddleware(store)
-	sr := router.PathPrefix("/reader/api/0").Subrouter()
-	sr.Use(middleware.apiKeyAuth)
-	sr.HandleFunc("/token", handler.tokenHandler).Methods(http.MethodGet).Name("Token")
-	sr.HandleFunc("/edit-tag", handler.editTagHandler).Methods(http.MethodPost).Name("EditTag")
-	sr.HandleFunc("/rename-tag", handler.renameTagHandler).Methods(http.MethodPost).Name("Rename Tag")
-	sr.HandleFunc("/disable-tag", handler.disableTagHandler).Methods(http.MethodPost).Name("Disable Tag")
-	sr.HandleFunc("/tag/list", handler.tagListHandler).Methods(http.MethodGet).Name("TagList")
-	sr.HandleFunc("/user-info", handler.userInfoHandler).Methods(http.MethodGet).Name("UserInfo")
-	sr.HandleFunc("/subscription/list", handler.subscriptionListHandler).Methods(http.MethodGet).Name("SubscriptonList")
-	sr.HandleFunc("/subscription/edit", handler.editSubscriptionHandler).Methods(http.MethodPost).Name("SubscriptionEdit")
-	sr.HandleFunc("/subscription/quickadd", handler.quickAddHandler).Methods(http.MethodPost).Name("QuickAdd")
-	sr.HandleFunc("/stream/items/ids", handler.streamItemIDsHandler).Methods(http.MethodGet).Name("StreamItemIDs")
-	sr.HandleFunc("/stream/items/contents", handler.streamItemContentsHandler).Methods(http.MethodPost).Name("StreamItemsContents")
-	sr.HandleFunc("/mark-all-as-read", handler.markAllAsReadHandler).Methods(http.MethodPost).Name("MarkAllAsRead")
-	sr.PathPrefix("/").HandlerFunc(handler.serveHandler).Methods(http.MethodPost, http.MethodGet).Name("GoogleReaderApiEndpoint")
+	authMiddleware := newAuthMiddleware(store)
+	withApiKeyAuth := func(fn http.HandlerFunc) http.Handler {
+		return authMiddleware.validateApiKey(fn)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /accounts/ClientLogin", h.clientLoginHandler)
+	mux.Handle("GET /reader/api/0/token", withApiKeyAuth(h.tokenHandler))
+	mux.Handle("POST /reader/api/0/edit-tag", withApiKeyAuth(h.editTagHandler))
+	mux.Handle("POST /reader/api/0/rename-tag", withApiKeyAuth(h.renameTagHandler))
+	mux.Handle("POST /reader/api/0/disable-tag", withApiKeyAuth(h.disableTagHandler))
+	mux.Handle("GET /reader/api/0/tag/list", withApiKeyAuth(h.tagListHandler))
+	mux.Handle("GET /reader/api/0/user-info", withApiKeyAuth(h.userInfoHandler))
+	mux.Handle("GET /reader/api/0/subscription/list", withApiKeyAuth(h.subscriptionListHandler))
+	mux.Handle("POST /reader/api/0/subscription/edit", withApiKeyAuth(h.editSubscriptionHandler))
+	mux.Handle("POST /reader/api/0/subscription/quickadd", withApiKeyAuth(h.quickAddHandler))
+	mux.Handle("GET /reader/api/0/stream/items/ids", withApiKeyAuth(h.streamItemIDsHandler))
+	mux.Handle("POST /reader/api/0/stream/items/contents", withApiKeyAuth(h.streamItemContentsHandler))
+	mux.Handle("POST /reader/api/0/mark-all-as-read", withApiKeyAuth(h.markAllAsReadHandler))
+	mux.Handle("GET /reader/api/0/", withApiKeyAuth(h.fallbackHandler))
+	mux.Handle("POST /reader/api/0/", withApiKeyAuth(h.fallbackHandler))
+
+	return mux
 }
 
-func checkAndSimplifyTags(addTags []Stream, removeTags []Stream) (map[StreamType]bool, error) {
-	tags := make(map[StreamType]bool)
-	for _, s := range addTags {
-		switch s.Type {
-		case ReadStream:
-			if _, ok := tags[KeptUnreadStream]; ok {
-				return nil, errSimultaneously
-			}
-			tags[ReadStream] = true
-		case KeptUnreadStream:
-			if _, ok := tags[ReadStream]; ok {
-				return nil, errSimultaneously
-			}
-			tags[ReadStream] = false
-		case StarredStream:
-			tags[StarredStream] = true
-		case BroadcastStream, LikeStream:
-			slog.Debug("Broadcast & Like tags are not implemented!")
-		default:
-			return nil, fmt.Errorf("googlereader: unsupported tag type: %s", s.Type)
-		}
-	}
-	for _, s := range removeTags {
-		switch s.Type {
-		case ReadStream:
-			if _, ok := tags[ReadStream]; ok {
-				return nil, errSimultaneously
-			}
-			tags[ReadStream] = false
-		case KeptUnreadStream:
-			if _, ok := tags[ReadStream]; ok {
-				return nil, errSimultaneously
-			}
-			tags[ReadStream] = true
-		case StarredStream:
-			if _, ok := tags[StarredStream]; ok {
-				return nil, fmt.Errorf("googlereader: %s should not be supplied for add and remove simultaneously", starredStreamSuffix)
-			}
-			tags[StarredStream] = false
-		case BroadcastStream, LikeStream:
-			slog.Debug("Broadcast & Like tags are not implemented!")
-		default:
-			return nil, fmt.Errorf("googlereader: unsupported tag type: %s", s.Type)
-		}
-	}
-
-	return tags, nil
+type greaderHandler struct {
+	store *storage.Storage
 }
 
-func checkOutputFormat(r *http.Request) error {
-	var output string
-	if r.Method == http.MethodPost {
-		err := r.ParseForm()
-		if err != nil {
-			return err
-		}
-		output = r.Form.Get("output")
-	} else {
-		output = request.QueryStringParam(r, "output", "")
-	}
-	if output != "json" {
-		return errors.New("googlereader: only json output is supported")
-	}
-	return nil
-}
-
-func (h *handler) clientLoginHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) clientLoginHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := request.ClientIP(r)
 
 	slog.Debug("[GoogleReader] Handle /accounts/ClientLogin",
@@ -204,13 +143,10 @@ func (h *handler) clientLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	builder := response.New(w, r)
-	builder.WithHeader("Content-Type", "text/plain; charset=UTF-8")
-	builder.WithBodyAsString(result.String())
-	builder.Write()
+	response.Text(w, r, result.String())
 }
 
-func (h *handler) tokenHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) tokenHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := request.ClientIP(r)
 
 	slog.Debug("[GoogleReader] Handle /token",
@@ -245,12 +181,10 @@ func (h *handler) tokenHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Int64("user_id", request.UserID(r)),
 	)
 
-	w.Header().Add("Content-Type", "text/plain; charset=UTF-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(token))
+	response.Text(w, r, token)
 }
 
-func (h *handler) editTagHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) editTagHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -304,7 +238,6 @@ func (h *handler) editTagHandler(w http.ResponseWriter, r *http.Request) {
 
 	builder := h.store.NewEntryQueryBuilder(userID)
 	builder.WithEntryIDs(itemIDs)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	entries, err := builder.GetEntries()
 	if err != nil {
@@ -313,15 +246,15 @@ func (h *handler) editTagHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n := 0
-	readEntryIDs := make([]int64, 0)
-	unreadEntryIDs := make([]int64, 0)
-	starredEntryIDs := make([]int64, 0)
-	unstarredEntryIDs := make([]int64, 0)
+	var readEntryIDs []int64
+	var unreadEntryIDs []int64
+	var starredEntryIDs []int64
+	var unstarredEntryIDs []int64
 	for _, entry := range entries {
 		if read, exists := tags[ReadStream]; exists {
 			if read && entry.Status == model.EntryStatusUnread {
 				readEntryIDs = append(readEntryIDs, entry.ID)
-			} else if entry.Status == model.EntryStatusRead {
+			} else if !read && entry.Status == model.EntryStatusRead {
 				unreadEntryIDs = append(unreadEntryIDs, entry.ID)
 			}
 		}
@@ -331,7 +264,7 @@ func (h *handler) editTagHandler(w http.ResponseWriter, r *http.Request) {
 				// filter the original array
 				entries[n] = entry
 				n++
-			} else if entry.Starred {
+			} else if !starred && entry.Starred {
 				unstarredEntryIDs = append(unstarredEntryIDs, entry.ID)
 			}
 		}
@@ -384,10 +317,10 @@ func (h *handler) editTagHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sendOkayResponse(w)
+	response.Text(w, r, "OK")
 }
 
-func (h *handler) quickAddHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) quickAddHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -582,14 +515,14 @@ func move(feedStream Stream, labelStream Stream, store *storage.Storage, userID 
 	return store.UpdateFeed(feed)
 }
 
-func (h *handler) feedIconURL(f *model.Feed) string {
+func (h *greaderHandler) feedIconURL(f *model.Feed) string {
 	if f.Icon != nil && f.Icon.ExternalIconID != "" {
-		return config.Opts.RootURL() + route.Path(h.router, "feedIcon", "externalIconID", f.Icon.ExternalIconID)
+		return config.Opts.BaseURL() + "/feed-icon/" + f.Icon.ExternalIconID
 	}
 	return ""
 }
 
-func (h *handler) editSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) editSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -665,10 +598,10 @@ func (h *handler) editSubscriptionHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	sendOkayResponse(w)
+	response.Text(w, r, "OK")
 }
 
-func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) streamItemContentsHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	userName := request.UserName(r)
 	clientIP := request.ClientIP(r)
@@ -718,7 +651,6 @@ func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Reque
 
 	builder := h.store.NewEntryQueryBuilder(userID)
 	builder.WithEnclosures()
-	builder.WithoutStatus(model.EntryStatusRemoved)
 	builder.WithEntryIDs(itemIDs)
 	builder.WithSorting(model.DefaultSortingOrder, requestModifiers.SortDirection)
 
@@ -734,7 +666,7 @@ func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Reque
 		Title:     "Reading List",
 		Updated:   time.Now().Unix(),
 		Self: []contentHREF{{
-			HREF: config.Opts.RootURL() + route.Path(h.router, "StreamItemsContents"),
+			HREF: config.Opts.BaseURL() + "/reader/api/0/stream/items/contents",
 		}},
 		Author: userName,
 		Items:  make([]contentItem, len(entries)),
@@ -746,7 +678,7 @@ func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Reque
 		for _, enclosure := range entry.Enclosures {
 			enclosures = append(enclosures, contentItemEnclosure{URL: enclosure.URL, Type: enclosure.MimeType})
 		}
-		categories := make([]string, 0)
+		categories := make([]string, 0, 4)
 		categories = append(categories, userReadingList)
 		if entry.Feed.Category.Title != "" {
 			categories = append(categories, labelPrefix+entry.Feed.Category.Title)
@@ -759,8 +691,8 @@ func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Reque
 			categories = append(categories, userStarred)
 		}
 
-		entry.Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(h.router, entry.Content)
-		entry.Enclosures.ProxifyEnclosureURL(h.router, config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
+		entry.Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(entry.Content)
+		entry.Enclosures.ProxifyEnclosureURL(config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
 
 		result.Items[i] = contentItem{
 			ID:            convertEntryIDToLongFormItemID(entry.ID),
@@ -802,7 +734,7 @@ func (h *handler) streamItemContentsHandler(w http.ResponseWriter, r *http.Reque
 	response.JSON(w, r, result)
 }
 
-func (h *handler) disableTagHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) disableTagHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -840,10 +772,10 @@ func (h *handler) disableTagHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendOkayResponse(w)
+	response.Text(w, r, "OK")
 }
 
-func (h *handler) renameTagHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) renameTagHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -907,10 +839,10 @@ func (h *handler) renameTagHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendOkayResponse(w)
+	response.Text(w, r, "OK")
 }
 
-func (h *handler) tagListHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) tagListHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -931,7 +863,7 @@ func (h *handler) tagListHandler(w http.ResponseWriter, r *http.Request) {
 		response.JSONServerError(w, r, err)
 		return
 	}
-	result.Tags = make([]subscriptionCategoryResponse, 0)
+	result.Tags = make([]subscriptionCategoryResponse, 0, 1+len(categories))
 	result.Tags = append(result.Tags, subscriptionCategoryResponse{
 		ID: fmt.Sprintf(userStreamPrefix, userID) + starredStreamSuffix,
 	})
@@ -946,7 +878,7 @@ func (h *handler) tagListHandler(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, result)
 }
 
-func (h *handler) subscriptionListHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) subscriptionListHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -969,7 +901,7 @@ func (h *handler) subscriptionListHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	labelPrefix := fmt.Sprintf(userLabelPrefix, userID)
-	result.Subscriptions = make([]subscriptionResponse, 0)
+	result.Subscriptions = make([]subscriptionResponse, 0, len(feeds))
 	for _, feed := range feeds {
 		result.Subscriptions = append(result.Subscriptions, subscriptionResponse{
 			ID:         feedPrefix + strconv.FormatInt(feed.ID, 10),
@@ -983,7 +915,7 @@ func (h *handler) subscriptionListHandler(w http.ResponseWriter, r *http.Request
 	response.JSON(w, r, result)
 }
 
-func (h *handler) serveHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) fallbackHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := request.ClientIP(r)
 
 	slog.Debug("[GoogleReader] API endpoint not implemented yet",
@@ -995,7 +927,7 @@ func (h *handler) serveHandler(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, []string{})
 }
 
-func (h *handler) userInfoHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) userInfoHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := request.ClientIP(r)
 
 	slog.Debug("[GoogleReader] Handle /user-info",
@@ -1018,7 +950,7 @@ func (h *handler) userInfoHandler(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, userInfo)
 }
 
-func (h *handler) streamItemIDsHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) streamItemIDsHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -1071,7 +1003,7 @@ func (h *handler) streamItemIDsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *handler) handleReadingListStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
+func (h *greaderHandler) handleReadingListStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
 	clientIP := request.ClientIP(r)
 
 	slog.Debug("[GoogleReader] Handle ReadingListStream",
@@ -1095,7 +1027,6 @@ func (h *handler) handleReadingListStreamHandler(w http.ResponseWriter, r *http.
 		}
 	}
 
-	builder.WithoutStatus(model.EntryStatusRemoved)
 	builder.WithLimit(rm.Count)
 	builder.WithOffset(rm.Offset)
 	builder.WithSorting(model.DefaultSortingOrder, rm.SortDirection)
@@ -1114,9 +1045,8 @@ func (h *handler) handleReadingListStreamHandler(w http.ResponseWriter, r *http.
 	response.JSON(w, r, streamIDResponse{itemRefs, continuation})
 }
 
-func (h *handler) handleStarredStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
+func (h *greaderHandler) handleStarredStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
 	builder := h.store.NewEntryQueryBuilder(rm.UserID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 	builder.WithStarred(true)
 	builder.WithLimit(rm.Count)
 	builder.WithOffset(rm.Offset)
@@ -1135,9 +1065,8 @@ func (h *handler) handleStarredStreamHandler(w http.ResponseWriter, r *http.Requ
 	response.JSON(w, r, streamIDResponse{itemRefs, continuation})
 }
 
-func (h *handler) handleReadStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
+func (h *greaderHandler) handleReadStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
 	builder := h.store.NewEntryQueryBuilder(rm.UserID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 	builder.WithStatus(model.EntryStatusRead)
 	builder.WithLimit(rm.Count)
 	builder.WithOffset(rm.Offset)
@@ -1179,7 +1108,7 @@ func getItemRefsAndContinuation(builder storage.EntryQueryBuilder, rm requestMod
 	return itemRefs, continuation, nil
 }
 
-func (h *handler) handleFeedStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
+func (h *greaderHandler) handleFeedStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
 	feedID, err := strconv.ParseInt(rm.Streams[0].ID, 10, 64)
 	if err != nil {
 		response.JSONServerError(w, r, err)
@@ -1187,7 +1116,6 @@ func (h *handler) handleFeedStreamHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	builder := h.store.NewEntryQueryBuilder(rm.UserID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 	builder.WithFeedID(feedID)
 	builder.WithLimit(rm.Count)
 	builder.WithOffset(rm.Offset)
@@ -1216,7 +1144,7 @@ func (h *handler) handleFeedStreamHandler(w http.ResponseWriter, r *http.Request
 	response.JSON(w, r, streamIDResponse{itemRefs, continuation})
 }
 
-func (h *handler) markAllAsReadHandler(w http.ResponseWriter, r *http.Request) {
+func (h *greaderHandler) markAllAsReadHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	clientIP := request.ClientIP(r)
 
@@ -1292,5 +1220,71 @@ func (h *handler) markAllAsReadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sendOkayResponse(w)
+	response.Text(w, r, "OK")
+}
+
+func checkAndSimplifyTags(addTags []Stream, removeTags []Stream) (map[StreamType]bool, error) {
+	tags := make(map[StreamType]bool)
+	for _, s := range addTags {
+		switch s.Type {
+		case ReadStream:
+			if _, ok := tags[KeptUnreadStream]; ok {
+				return nil, errSimultaneously
+			}
+			tags[ReadStream] = true
+		case KeptUnreadStream:
+			if _, ok := tags[ReadStream]; ok {
+				return nil, errSimultaneously
+			}
+			tags[ReadStream] = false
+		case StarredStream:
+			tags[StarredStream] = true
+		case BroadcastStream, LikeStream:
+			slog.Debug("Broadcast & Like tags are not implemented!")
+		default:
+			return nil, fmt.Errorf("googlereader: unsupported tag type: %s", s.Type)
+		}
+	}
+	for _, s := range removeTags {
+		switch s.Type {
+		case ReadStream:
+			if _, ok := tags[ReadStream]; ok {
+				return nil, errSimultaneously
+			}
+			tags[ReadStream] = false
+		case KeptUnreadStream:
+			if _, ok := tags[ReadStream]; ok {
+				return nil, errSimultaneously
+			}
+			tags[ReadStream] = true
+		case StarredStream:
+			if _, ok := tags[StarredStream]; ok {
+				return nil, fmt.Errorf("googlereader: %s should not be supplied for add and remove simultaneously", starredStreamSuffix)
+			}
+			tags[StarredStream] = false
+		case BroadcastStream, LikeStream:
+			slog.Debug("Broadcast & Like tags are not implemented!")
+		default:
+			return nil, fmt.Errorf("googlereader: unsupported tag type: %s", s.Type)
+		}
+	}
+
+	return tags, nil
+}
+
+func checkOutputFormat(r *http.Request) error {
+	var output string
+	if r.Method == http.MethodPost {
+		err := r.ParseForm()
+		if err != nil {
+			return err
+		}
+		output = r.Form.Get("output")
+	} else {
+		output = request.QueryStringParam(r, "output", "")
+	}
+	if output != "json" {
+		return errors.New("googlereader: only json output is supported")
+	}
+	return nil
 }

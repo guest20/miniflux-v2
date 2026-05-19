@@ -11,12 +11,10 @@ import (
 	"miniflux.app/v2/internal/config"
 	"miniflux.app/v2/internal/http/request"
 	"miniflux.app/v2/internal/http/response"
-	"miniflux.app/v2/internal/http/route"
 	"miniflux.app/v2/internal/locale"
 	"miniflux.app/v2/internal/proxyrotator"
 	"miniflux.app/v2/internal/reader/fetcher"
 	"miniflux.app/v2/internal/reader/opml"
-	"miniflux.app/v2/internal/ui/session"
 	"miniflux.app/v2/internal/ui/view"
 )
 
@@ -34,7 +32,7 @@ func (h *handler) uploadOPML(w http.ResponseWriter, r *http.Request) {
 			slog.Any("error", err),
 		)
 
-		response.HTMLRedirect(w, r, route.Path(h.router, "import"))
+		response.HTMLRedirect(w, r, h.routePath("/import"))
 		return
 	}
 	defer file.Close()
@@ -45,12 +43,12 @@ func (h *handler) uploadOPML(w http.ResponseWriter, r *http.Request) {
 		slog.Int64("file_size", fileHeader.Size),
 	)
 
-	sess := session.New(h.store, request.SessionID(r))
-	view := view.New(h.tpl, r, sess)
+	view := view.New(h.tpl, r)
 	view.Set("menu", "feeds")
 	view.Set("user", user)
-	view.Set("countUnread", h.store.CountUnreadEntries(user.ID))
-	view.Set("countErrorFeeds", h.store.CountUserFeedsWithErrors(user.ID))
+	navMetadata, _ := h.store.GetNavMetadata(user.ID)
+	view.Set("countUnread", navMetadata.CountUnread)
+	view.Set("countErrorFeeds", navMetadata.CountErrorFeeds)
 
 	if fileHeader.Size == 0 {
 		view.Set("errorMessage", locale.NewLocalizedError("error.empty_file").Translate(user.Language))
@@ -64,7 +62,7 @@ func (h *handler) uploadOPML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.HTMLRedirect(w, r, route.Path(h.router, "feeds"))
+	response.HTMLRedirect(w, r, h.routePath("/feeds"))
 }
 
 func (h *handler) fetchOPML(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +74,7 @@ func (h *handler) fetchOPML(w http.ResponseWriter, r *http.Request) {
 
 	opmlFileURL := strings.TrimSpace(r.FormValue("url"))
 	if opmlFileURL == "" {
-		response.HTMLRedirect(w, r, route.Path(h.router, "import"))
+		response.HTMLRedirect(w, r, h.routePath("/import"))
 		return
 	}
 
@@ -85,12 +83,12 @@ func (h *handler) fetchOPML(w http.ResponseWriter, r *http.Request) {
 		slog.String("opml_file_url", opmlFileURL),
 	)
 
-	sess := session.New(h.store, request.SessionID(r))
-	view := view.New(h.tpl, r, sess)
+	view := view.New(h.tpl, r)
 	view.Set("menu", "feeds")
 	view.Set("user", user)
-	view.Set("countUnread", h.store.CountUnreadEntries(user.ID))
-	view.Set("countErrorFeeds", h.store.CountUserFeedsWithErrors(user.ID))
+	navMetadata, _ := h.store.GetNavMetadata(user.ID)
+	view.Set("countUnread", navMetadata.CountUnread)
+	view.Set("countErrorFeeds", navMetadata.CountErrorFeeds)
 
 	requestBuilder := fetcher.NewRequestBuilder()
 	requestBuilder.WithTimeout(config.Opts.HTTPClientTimeout())
@@ -112,5 +110,5 @@ func (h *handler) fetchOPML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.HTMLRedirect(w, r, route.Path(h.router, "feeds"))
+	response.HTMLRedirect(w, r, h.routePath("/feeds"))
 }

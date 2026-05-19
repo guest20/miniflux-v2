@@ -6,6 +6,7 @@ package api // import "miniflux.app/v2/internal/api"
 import (
 	json_parser "encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"miniflux.app/v2/internal/http/request"
@@ -14,7 +15,7 @@ import (
 	"miniflux.app/v2/internal/validator"
 )
 
-func (h *handler) currentUser(w http.ResponseWriter, r *http.Request) {
+func (h *handler) currentUserHandler(w http.ResponseWriter, r *http.Request) {
 	user, err := h.store.UserByID(request.UserID(r))
 	if err != nil {
 		response.JSONServerError(w, r, err)
@@ -24,7 +25,7 @@ func (h *handler) currentUser(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, user)
 }
 
-func (h *handler) createUser(w http.ResponseWriter, r *http.Request) {
+func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	if !request.IsAdminUser(r) {
 		response.JSONForbidden(w, r)
 		return
@@ -50,8 +51,12 @@ func (h *handler) createUser(w http.ResponseWriter, r *http.Request) {
 	response.JSONCreated(w, r, user)
 }
 
-func (h *handler) updateUser(w http.ResponseWriter, r *http.Request) {
+func (h *handler) updateUserHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.RouteInt64Param(r, "userID")
+	if userID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid user ID"))
+		return
+	}
 
 	var userModificationRequest model.UserModificationRequest
 	if err := json_parser.NewDecoder(r.Body).Decode(&userModificationRequest); err != nil {
@@ -96,8 +101,13 @@ func (h *handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	response.JSONCreated(w, r, originalUser)
 }
 
-func (h *handler) markUserAsRead(w http.ResponseWriter, r *http.Request) {
+func (h *handler) markUserAsReadHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.RouteInt64Param(r, "userID")
+	if userID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid user ID"))
+		return
+	}
+
 	if userID != request.UserID(r) {
 		response.JSONForbidden(w, r)
 		return
@@ -113,12 +123,11 @@ func (h *handler) markUserAsRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.JSONNoContent(w, r)
+	response.NoContent(w, r)
 }
 
-func (h *handler) getIntegrationsStatus(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getIntegrationsStatusHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
-
 	if _, err := h.store.UserByID(userID); err != nil {
 		response.JSONNotFound(w, r)
 		return
@@ -129,7 +138,7 @@ func (h *handler) getIntegrationsStatus(w http.ResponseWriter, r *http.Request) 
 	response.JSON(w, r, integrationsStatusResponse{HasIntegrations: hasIntegrations})
 }
 
-func (h *handler) users(w http.ResponseWriter, r *http.Request) {
+func (h *handler) usersHandler(w http.ResponseWriter, r *http.Request) {
 	if !request.IsAdminUser(r) {
 		response.JSONForbidden(w, r)
 		return
@@ -145,13 +154,31 @@ func (h *handler) users(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, users)
 }
 
-func (h *handler) userByID(w http.ResponseWriter, r *http.Request) {
+func (h *handler) dispatchUserLookupHandler(w http.ResponseWriter, r *http.Request) {
+	identifier := request.RouteStringParam(r, "identifier")
+	userID := request.RouteInt64Param(r, "identifier")
+	if userID > 0 {
+		r.SetPathValue("userID", identifier)
+		h.userByIDHandler(w, r)
+		return
+	}
+
+	r.SetPathValue("username", identifier)
+	h.userByUsernameHandler(w, r)
+}
+
+func (h *handler) userByIDHandler(w http.ResponseWriter, r *http.Request) {
 	if !request.IsAdminUser(r) {
 		response.JSONForbidden(w, r)
 		return
 	}
 
 	userID := request.RouteInt64Param(r, "userID")
+	if userID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid user ID"))
+		return
+	}
+
 	user, err := h.store.UserByID(userID)
 	if err != nil {
 		response.JSONBadRequest(w, r, errors.New("unable to fetch this user from the database"))
@@ -167,7 +194,7 @@ func (h *handler) userByID(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, user)
 }
 
-func (h *handler) userByUsername(w http.ResponseWriter, r *http.Request) {
+func (h *handler) userByUsernameHandler(w http.ResponseWriter, r *http.Request) {
 	if !request.IsAdminUser(r) {
 		response.JSONForbidden(w, r)
 		return
@@ -188,13 +215,18 @@ func (h *handler) userByUsername(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, user)
 }
 
-func (h *handler) removeUser(w http.ResponseWriter, r *http.Request) {
+func (h *handler) removeUserHandler(w http.ResponseWriter, r *http.Request) {
 	if !request.IsAdminUser(r) {
 		response.JSONForbidden(w, r)
 		return
 	}
 
 	userID := request.RouteInt64Param(r, "userID")
+	if userID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid user ID"))
+		return
+	}
+
 	user, err := h.store.UserByID(userID)
 	if err != nil {
 		response.JSONServerError(w, r, err)
@@ -211,6 +243,13 @@ func (h *handler) removeUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.store.RemoveUserAsync(user.ID)
-	response.JSONNoContent(w, r)
+	go func() {
+		if err := h.store.RemoveUser(user.ID); err != nil {
+			slog.Error("Unable to delete user",
+				slog.Int64("user_id", user.ID),
+				slog.Any("error", err),
+			)
+		}
+	}()
+	response.NoContent(w, r)
 }

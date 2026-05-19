@@ -25,11 +25,20 @@ type EntryQueryBuilder struct {
 	limit           int
 	offset          int
 	fetchEnclosures bool
+	excludeContent  bool
 }
 
 // WithEnclosures fetches enclosures for each entry.
 func (e *EntryQueryBuilder) WithEnclosures() *EntryQueryBuilder {
 	e.fetchEnclosures = true
+	return e
+}
+
+// WithoutContent excludes the content column from the query results,
+// replacing it with an empty string. This significantly reduces data
+// transfer from PostgreSQL on list pages where content is not displayed.
+func (e *EntryQueryBuilder) WithoutContent() *EntryQueryBuilder {
+	e.excludeContent = true
 	return e
 }
 
@@ -41,9 +50,9 @@ func (e *EntryQueryBuilder) WithSearchQuery(query string) *EntryQueryBuilder {
 		e.args = append(e.args, query)
 
 		// 0.0000001 = 0.1 / (seconds_in_a_day)
-		e.WithSorting(
-			fmt.Sprintf("ts_rank(document_vectors, plainto_tsquery($%d)) - extract (epoch from now() - published_at)::float * 0.0000001", nArgs),
-			"DESC",
+
+		e.sortExpressions = append(e.sortExpressions,
+			fmt.Sprintf("ts_rank(document_vectors, plainto_tsquery($%d)) - extract (epoch from now() - published_at)::float * 0.0000001 DESC", nArgs),
 		)
 	}
 	return e
@@ -107,8 +116,13 @@ func (e *EntryQueryBuilder) AfterEntryID(entryID int64) *EntryQueryBuilder {
 
 // WithEntryIDs filter by entry IDs.
 func (e *EntryQueryBuilder) WithEntryIDs(entryIDs []int64) *EntryQueryBuilder {
-	e.conditions = append(e.conditions, fmt.Sprintf("e.id = ANY($%d)", len(e.args)+1))
-	e.args = append(e.args, pq.Int64Array(entryIDs))
+	if len(entryIDs) == 1 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.id = $%d", len(e.args)+1))
+		e.args = append(e.args, entryIDs[0])
+	} else if len(entryIDs) > 1 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.id = ANY($%d)", len(e.args)+1))
+		e.args = append(e.args, pq.Int64Array(entryIDs))
+	}
 	return e
 }
 
@@ -150,7 +164,10 @@ func (e *EntryQueryBuilder) WithStatus(status string) *EntryQueryBuilder {
 
 // WithStatuses filter by a list of entry statuses.
 func (e *EntryQueryBuilder) WithStatuses(statuses []string) *EntryQueryBuilder {
-	if len(statuses) > 0 {
+	if len(statuses) == 1 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.status = $%d", len(e.args)+1))
+		e.args = append(e.args, statuses[0])
+	} else if len(statuses) > 1 {
 		e.conditions = append(e.conditions, fmt.Sprintf("e.status = ANY($%d)", len(e.args)+1))
 		e.args = append(e.args, pq.StringArray(statuses))
 	}
@@ -192,14 +209,20 @@ func (e *EntryQueryBuilder) WithShareCodeNotEmpty() *EntryQueryBuilder {
 
 // WithSorting add a sort expression.
 func (e *EntryQueryBuilder) WithSorting(column, direction string) *EntryQueryBuilder {
-	e.sortExpressions = append(e.sortExpressions, column+" "+direction)
+	switch {
+	case strings.EqualFold(direction, "ASC"):
+		e.sortExpressions = append(e.sortExpressions, pq.QuoteIdentifier(column)+" ASC")
+	case strings.EqualFold(direction, "DESC"):
+		e.sortExpressions = append(e.sortExpressions, pq.QuoteIdentifier(column)+" DESC")
+	}
+
 	return e
 }
 
 // WithLimit set the limit.
 func (e *EntryQueryBuilder) WithLimit(limit int) *EntryQueryBuilder {
 	if limit > 0 {
-		e.limit = limit
+		e.limit = min(limit, model.MaxEntryLimit)
 	}
 	return e
 }
@@ -257,8 +280,29 @@ func (e *EntryQueryBuilder) GetEntry() (*model.Entry, error) {
 
 // GetEntries returns a list of entries that match the condition.
 func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
+	entries, _, err := e.fetchEntries(false)
+	return entries, err
+}
+
+// GetEntriesWithCount returns a list of entries and the total count of matching
+// rows (ignoring limit/offset) in a single query using a window function.
+// This avoids a separate CountEntries() round-trip.
+func (e *EntryQueryBuilder) GetEntriesWithCount() (model.Entries, int, error) {
+	return e.fetchEntries(true)
+}
+
+// fetchEntries is the shared implementation for GetEntries and GetEntriesWithCount.
+// When withCount is true, count(*) OVER() is included in the SELECT and the total
+// count of matching rows is returned; otherwise the returned count is 0.
+func (e *EntryQueryBuilder) fetchEntries(withCount bool) (model.Entries, int, error) {
+	countColumn := ""
+	if withCount {
+		countColumn = "count(*) OVER(),"
+	}
+
 	query := `
 		SELECT
+			` + countColumn + `
 			e.id,
 			e.user_id,
 			e.feed_id,
@@ -269,7 +313,7 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 			e.comments_url,
 			e.author,
 			e.share_code,
-			e.content,
+			` + e.contentColumn() + `,
 			e.status,
 			e.starred,
 			e.reading_time,
@@ -311,13 +355,15 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 
 	rows, err := e.store.db.Query(query, e.args...)
 	if err != nil {
-		return nil, fmt.Errorf("store: unable to get entries: %v", err)
+		return nil, 0, fmt.Errorf("store: unable to get entries: %v", err)
 	}
 	defer rows.Close()
 
-	entries := make(model.Entries, 0)
-	entryMap := make(map[int64]*model.Entry)
-	var entryIDs []int64
+	size := max(e.limit, 0)
+	entries := make(model.Entries, 0, size)
+	entryMap := make(map[int64]*model.Entry, size)
+	entryIDs := make([]int64, 0, size)
+	var totalCount int
 
 	for rows.Next() {
 		var iconID sql.NullInt64
@@ -326,7 +372,7 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 
 		entry := model.NewEntry()
 
-		err := rows.Scan(
+		dest := []any{
 			&entry.ID,
 			&entry.UserID,
 			&entry.FeedID,
@@ -363,10 +409,15 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 			&iconID,
 			&externalIconID,
 			&tz,
-		)
+		}
 
+		if withCount {
+			dest = append([]any{&totalCount}, dest...)
+		}
+
+		err := rows.Scan(dest...)
 		if err != nil {
-			return nil, fmt.Errorf("store: unable to fetch entry row: %v", err)
+			return nil, 0, fmt.Errorf("store: unable to fetch entry row: %v", err)
 		}
 
 		if iconID.Valid && externalIconID.Valid && externalIconID.String != "" {
@@ -396,7 +447,7 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 	if e.fetchEnclosures && len(entryIDs) > 0 {
 		enclosures, err := e.store.GetEnclosuresForEntries(entryIDs)
 		if err != nil {
-			return nil, fmt.Errorf("store: unable to fetch enclosures: %w", err)
+			return nil, 0, fmt.Errorf("store: unable to fetch enclosures: %w", err)
 		}
 
 		for entryID, entryEnclosures := range enclosures {
@@ -406,7 +457,7 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 		}
 	}
 
-	return entries, nil
+	return entries, totalCount, nil
 }
 
 // GetEntryIDs returns a list of entry IDs that match the condition.
@@ -441,6 +492,13 @@ func (e *EntryQueryBuilder) GetEntryIDs() ([]int64, error) {
 	}
 
 	return entryIDs, nil
+}
+
+func (e *EntryQueryBuilder) contentColumn() string {
+	if e.excludeContent {
+		return "'' AS content"
+	}
+	return "e.content"
 }
 
 func (e *EntryQueryBuilder) buildCondition() string {

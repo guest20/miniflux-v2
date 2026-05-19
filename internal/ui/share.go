@@ -10,9 +10,7 @@ import (
 	"miniflux.app/v2/internal/http/request"
 	"miniflux.app/v2/internal/http/response"
 
-	"miniflux.app/v2/internal/http/route"
 	"miniflux.app/v2/internal/storage"
-	"miniflux.app/v2/internal/ui/session"
 	"miniflux.app/v2/internal/ui/view"
 )
 
@@ -24,7 +22,7 @@ func (h *handler) createSharedEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.HTMLRedirect(w, r, route.Path(h.router, "sharedEntry", "shareCode", shareCode))
+	response.HTMLRedirect(w, r, h.routePath("/share/%s", shareCode))
 }
 
 func (h *handler) unshareEntry(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +32,7 @@ func (h *handler) unshareEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.HTMLRedirect(w, r, route.Path(h.router, "sharedEntries"))
+	response.HTMLRedirect(w, r, h.routePath("/shares"))
 }
 
 func (h *handler) sharedEntry(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +43,7 @@ func (h *handler) sharedEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	etag := shareCode
-	response.New(w, r).WithCaching(etag, 72*time.Hour, func(b *response.Builder) {
+	response.NewBuilder(w, r).WithCaching(etag, 72*time.Hour, func(b *response.Builder) {
 		builder := storage.NewAnonymousQueryBuilder(h.store)
 		builder.WithShareCode(shareCode)
 
@@ -55,8 +53,7 @@ func (h *handler) sharedEntry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sess := session.New(h.store, request.SessionID(r))
-		view := view.New(h.tpl, r, sess)
+		view := view.New(h.tpl, r)
 		view.Set("entry", entry)
 
 		b.WithHeader("Content-Type", "text/html; charset=utf-8")

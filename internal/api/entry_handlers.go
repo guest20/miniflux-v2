@@ -36,56 +36,85 @@ func (h *handler) getEntryFromBuilder(w http.ResponseWriter, r *http.Request, b 
 		return
 	}
 
-	entry.Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(h.router, entry.Content)
-	entry.Enclosures.ProxifyEnclosureURL(h.router, config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
+	entry.Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(entry.Content)
+	entry.Enclosures.ProxifyEnclosureURL(config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
 
 	response.JSON(w, r, entry)
 }
 
-func (h *handler) getFeedEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getFeedEntryHandler(w http.ResponseWriter, r *http.Request) {
 	feedID := request.RouteInt64Param(r, "feedID")
+	if feedID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid feed ID"))
+		return
+	}
+
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
 
 	builder := h.store.NewEntryQueryBuilder(request.UserID(r))
 	builder.WithFeedID(feedID)
 	builder.WithEntryID(entryID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	h.getEntryFromBuilder(w, r, builder)
 }
 
-func (h *handler) getCategoryEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getCategoryEntryHandler(w http.ResponseWriter, r *http.Request) {
 	categoryID := request.RouteInt64Param(r, "categoryID")
+	if categoryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid category ID"))
+		return
+	}
+
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
 
 	builder := h.store.NewEntryQueryBuilder(request.UserID(r))
 	builder.WithCategoryID(categoryID)
 	builder.WithEntryID(entryID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	h.getEntryFromBuilder(w, r, builder)
 }
 
-func (h *handler) getEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getEntryHandler(w http.ResponseWriter, r *http.Request) {
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
+
 	builder := h.store.NewEntryQueryBuilder(request.UserID(r))
 	builder.WithEntryID(entryID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	h.getEntryFromBuilder(w, r, builder)
 }
 
-func (h *handler) getFeedEntries(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getFeedEntriesHandler(w http.ResponseWriter, r *http.Request) {
 	feedID := request.RouteInt64Param(r, "feedID")
+	if feedID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid feed ID"))
+		return
+	}
+
 	h.findEntries(w, r, feedID, 0)
 }
 
-func (h *handler) getCategoryEntries(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getCategoryEntriesHandler(w http.ResponseWriter, r *http.Request) {
 	categoryID := request.RouteInt64Param(r, "categoryID")
+	if categoryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid category ID"))
+		return
+	}
 	h.findEntries(w, r, 0, categoryID)
 }
 
-func (h *handler) getEntries(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getEntriesHandler(w http.ResponseWriter, r *http.Request) {
 	h.findEntries(w, r, 0, 0)
 }
 
@@ -141,7 +170,6 @@ func (h *handler) findEntries(w http.ResponseWriter, r *http.Request, feedID int
 	builder.WithLimit(limit)
 	builder.WithTags(tags)
 	builder.WithEnclosures()
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	if request.HasQueryParam(r, "globally_visible") {
 		globallyVisible := request.QueryBoolParam(r, "globally_visible", true)
@@ -153,26 +181,20 @@ func (h *handler) findEntries(w http.ResponseWriter, r *http.Request, feedID int
 
 	configureFilters(builder, r)
 
-	entries, err := builder.GetEntries()
-	if err != nil {
-		response.JSONServerError(w, r, err)
-		return
-	}
-
-	count, err := builder.CountEntries()
+	entries, count, err := builder.GetEntriesWithCount()
 	if err != nil {
 		response.JSONServerError(w, r, err)
 		return
 	}
 
 	for i := range entries {
-		entries[i].Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(h.router, entries[i].Content)
+		entries[i].Content = mediaproxy.RewriteDocumentWithAbsoluteProxyURL(entries[i].Content)
 	}
 
 	response.JSON(w, r, &entriesResponse{Total: count, Entries: entries})
 }
 
-func (h *handler) setEntryStatus(w http.ResponseWriter, r *http.Request) {
+func (h *handler) setEntryStatusHandler(w http.ResponseWriter, r *http.Request) {
 	var entriesStatusUpdateRequest model.EntriesStatusUpdateRequest
 	if err := json_parser.NewDecoder(r.Body).Decode(&entriesStatusUpdateRequest); err != nil {
 		response.JSONBadRequest(w, r, err)
@@ -189,24 +211,33 @@ func (h *handler) setEntryStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.JSONNoContent(w, r)
+	response.NoContent(w, r)
 }
 
-func (h *handler) toggleStarred(w http.ResponseWriter, r *http.Request) {
+func (h *handler) toggleStarredHandler(w http.ResponseWriter, r *http.Request) {
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
+
 	if err := h.store.ToggleStarred(request.UserID(r), entryID); err != nil {
 		response.JSONServerError(w, r, err)
 		return
 	}
 
-	response.JSONNoContent(w, r)
+	response.NoContent(w, r)
 }
 
-func (h *handler) saveEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) saveEntryHandler(w http.ResponseWriter, r *http.Request) {
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
+
 	builder := h.store.NewEntryQueryBuilder(request.UserID(r))
 	builder.WithEntryID(entryID)
-	builder.WithoutStatus(model.EntryStatusRemoved)
 
 	if !h.store.HasSaveEntry(request.UserID(r)) {
 		response.JSONBadRequest(w, r, errors.New("no third-party integration enabled"))
@@ -235,7 +266,7 @@ func (h *handler) saveEntry(w http.ResponseWriter, r *http.Request) {
 	response.JSONAccepted(w, r)
 }
 
-func (h *handler) updateEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) updateEntryHandler(w http.ResponseWriter, r *http.Request) {
 	var entryUpdateRequest model.EntryUpdateRequest
 	if err := json_parser.NewDecoder(r.Body).Decode(&entryUpdateRequest); err != nil {
 		response.JSONBadRequest(w, r, err)
@@ -247,12 +278,15 @@ func (h *handler) updateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	loggedUserID := request.UserID(r)
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
 
+	loggedUserID := request.UserID(r)
 	entryBuilder := h.store.NewEntryQueryBuilder(loggedUserID)
 	entryBuilder.WithEntryID(entryID)
-	entryBuilder.WithoutStatus(model.EntryStatusRemoved)
 
 	entry, err := entryBuilder.GetEntry()
 	if err != nil {
@@ -294,10 +328,10 @@ func (h *handler) updateEntry(w http.ResponseWriter, r *http.Request) {
 	response.JSONCreated(w, r, entry)
 }
 
-func (h *handler) importFeedEntry(w http.ResponseWriter, r *http.Request) {
+func (h *handler) importFeedEntryHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
-	feedID := request.RouteInt64Param(r, "feedID")
 
+	feedID := request.RouteInt64Param(r, "feedID")
 	if feedID <= 0 {
 		response.JSONBadRequest(w, r, errors.New("invalid feed ID"))
 		return
@@ -372,6 +406,10 @@ func (h *handler) importFeedEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	created, err := h.store.InsertEntryForFeed(userID, feedID, entry)
+	if errors.Is(err, storage.ErrEntryTombstoned) {
+		response.JSONBadRequest(w, r, err)
+		return
+	}
 	if err != nil {
 		response.JSONServerError(w, r, err)
 		return
@@ -398,13 +436,17 @@ func (h *handler) importFeedEntry(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *handler) fetchContent(w http.ResponseWriter, r *http.Request) {
+func (h *handler) fetchContentHandler(w http.ResponseWriter, r *http.Request) {
 	loggedUserID := request.UserID(r)
+
 	entryID := request.RouteInt64Param(r, "entryID")
+	if entryID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid entry ID"))
+		return
+	}
 
 	entryBuilder := h.store.NewEntryQueryBuilder(loggedUserID)
 	entryBuilder.WithEntryID(entryID)
-	entryBuilder.WithoutStatus(model.EntryStatusRemoved)
 
 	entry, err := entryBuilder.GetEntry()
 	if err != nil {
@@ -454,10 +496,10 @@ func (h *handler) fetchContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response.JSON(w, r, entryContentResponse{Content: mediaproxy.RewriteDocumentWithAbsoluteProxyURL(h.router, entry.Content), ReadingTime: entry.ReadingTime})
+	response.JSON(w, r, entryContentResponse{Content: mediaproxy.RewriteDocumentWithAbsoluteProxyURL(entry.Content), ReadingTime: entry.ReadingTime})
 }
 
-func (h *handler) flushHistory(w http.ResponseWriter, r *http.Request) {
+func (h *handler) flushHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	loggedUserID := request.UserID(r)
 	go h.store.FlushHistory(loggedUserID)
 	response.JSONAccepted(w, r)

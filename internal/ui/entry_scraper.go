@@ -10,7 +10,6 @@ import (
 	"miniflux.app/v2/internal/http/response"
 	"miniflux.app/v2/internal/locale"
 	"miniflux.app/v2/internal/mediaproxy"
-	"miniflux.app/v2/internal/model"
 	"miniflux.app/v2/internal/reader/processor"
 	"miniflux.app/v2/internal/storage"
 )
@@ -21,7 +20,6 @@ func (h *handler) fetchContent(w http.ResponseWriter, r *http.Request) {
 
 	entryBuilder := h.store.NewEntryQueryBuilder(loggedUserID)
 	entryBuilder.WithEntryID(entryID)
-	entryBuilder.WithoutStatus(model.EntryStatusRemoved)
 
 	entry, err := entryBuilder.GetEntry()
 	if err != nil {
@@ -65,5 +63,5 @@ func (h *handler) fetchContent(w http.ResponseWriter, r *http.Request) {
 
 	readingTime := locale.NewPrinter(user.Language).Plural("entry.estimated_reading_time", entry.ReadingTime, entry.ReadingTime)
 
-	response.JSON(w, r, map[string]string{"content": mediaproxy.RewriteDocumentWithRelativeProxyURL(h.router, entry.Content), "reading_time": readingTime})
+	response.JSON(w, r, map[string]string{"content": mediaproxy.RewriteDocumentWithRelativeProxyURL(entry.Content), "reading_time": readingTime})
 }

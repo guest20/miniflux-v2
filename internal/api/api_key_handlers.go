@@ -15,7 +15,7 @@ import (
 	"miniflux.app/v2/internal/validator"
 )
 
-func (h *handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
+func (h *handler) createAPIKeyHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 
 	var apiKeyCreationRequest model.APIKeyCreationRequest
@@ -38,7 +38,7 @@ func (h *handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 	response.JSONCreated(w, r, apiKey)
 }
 
-func (h *handler) getAPIKeys(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getAPIKeysHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	apiKeys, err := h.store.APIKeys(userID)
 	if err != nil {
@@ -48,9 +48,13 @@ func (h *handler) getAPIKeys(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, r, apiKeys)
 }
 
-func (h *handler) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
+func (h *handler) deleteAPIKeyHandler(w http.ResponseWriter, r *http.Request) {
 	userID := request.UserID(r)
 	apiKeyID := request.RouteInt64Param(r, "apiKeyID")
+	if apiKeyID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid API key ID"))
+		return
+	}
 
 	if err := h.store.DeleteAPIKey(userID, apiKeyID); err != nil {
 		if errors.Is(err, storage.ErrAPIKeyNotFound) {
@@ -60,5 +64,5 @@ func (h *handler) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		response.JSONServerError(w, r, err)
 		return
 	}
-	response.JSONNoContent(w, r)
+	response.NoContent(w, r)
 }

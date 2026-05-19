@@ -5,6 +5,7 @@ package api // import "miniflux.app/v2/internal/api"
 
 import (
 	json_parser "encoding/json"
+	"errors"
 	"net/http"
 
 	"miniflux.app/v2/internal/config"
@@ -14,8 +15,12 @@ import (
 	"miniflux.app/v2/internal/validator"
 )
 
-func (h *handler) getEnclosureByID(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getEnclosureByIDHandler(w http.ResponseWriter, r *http.Request) {
 	enclosureID := request.RouteInt64Param(r, "enclosureID")
+	if enclosureID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid enclosure ID"))
+		return
+	}
 
 	enclosure, err := h.store.GetEnclosure(enclosureID)
 	if err != nil {
@@ -34,13 +39,17 @@ func (h *handler) getEnclosureByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	enclosure.ProxifyEnclosureURL(h.router, config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
+	enclosure.ProxifyEnclosureURL(config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
 
 	response.JSON(w, r, enclosure)
 }
 
-func (h *handler) updateEnclosureByID(w http.ResponseWriter, r *http.Request) {
+func (h *handler) updateEnclosureByIDHandler(w http.ResponseWriter, r *http.Request) {
 	enclosureID := request.RouteInt64Param(r, "enclosureID")
+	if enclosureID == 0 {
+		response.JSONBadRequest(w, r, errors.New("invalid enclosure ID"))
+		return
+	}
 
 	var enclosureUpdateRequest model.EnclosureUpdateRequest
 	if err := json_parser.NewDecoder(r.Body).Decode(&enclosureUpdateRequest); err != nil {
@@ -76,5 +85,5 @@ func (h *handler) updateEnclosureByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.JSONNoContent(w, r)
+	response.NoContent(w, r)
 }
